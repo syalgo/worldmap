@@ -37,6 +37,14 @@ body{margin:0;padding:16px;background:var(--page-bg);color:var(--ink);font-famil
 .bottom-actions{display:flex;justify-content:center;margin-top:14px}.save-btn{min-width:190px;min-height:46px;background:#111;color:#fff;border-color:#111}.save-btn:hover{background:#282828}
 .status{margin-top:8px;min-height:18px;text-align:center;color:#555;font-size:13px;font-weight:700}
 @media (max-width:760px){body{padding:8px}.worksheet{padding:10px}.title{font-size:21px}.topline{justify-content:flex-start;gap:10px}.field-input{width:150px}.field-input.date{width:110px}.answer-area{grid-template-columns:1fr;gap:6px}.legend-title{text-align:left;margin-left:31px}.legend{margin-left:31px}}
+.save-overlay{position:fixed;inset:0;background:rgba(0,0,0,.42);display:none;align-items:center;justify-content:center;padding:20px;z-index:9999}
+.save-overlay.show{display:flex}
+.save-dialog{width:min(420px,100%);background:#fff;border-radius:14px;padding:20px;box-shadow:0 12px 40px rgba(0,0,0,.25);text-align:center}
+.save-dialog h2{margin:0 0 8px;font-size:20px}
+.save-dialog p{margin:0 0 16px;color:#555;font-size:14px;line-height:1.45}
+.save-dialog-actions{display:flex;gap:8px;justify-content:center;flex-wrap:wrap}
+.save-dialog button{appearance:none;border:1px solid var(--ui-border);background:#fff;color:#111;border-radius:9px;min-height:44px;padding:9px 14px;font-size:14px;font-weight:700;cursor:pointer}
+.save-dialog .primary{background:#111;color:#fff;border-color:#111}
 @media print{body{background:#fff;padding:0}.worksheet{box-shadow:none;border:0}.map-tools,.bottom-actions,.status{display:none!important}}
 </style>
 </head>
@@ -201,9 +209,20 @@ body{margin:0;padding:16px;background:var(--page-bg);color:var(--ink);font-famil
 </section>
 <div class="bottom-actions" data-export-ignore=""><button class="save-btn" id="saveImage" type="button">Save as Image</button></div><div aria-live="polite" class="status" id="status"></div>
 </main>
+<div class="save-overlay" id="saveOverlay" aria-hidden="true">
+  <div class="save-dialog" role="dialog" aria-modal="true" aria-labelledby="saveDialogTitle">
+    <h2 id="saveDialogTitle">Image ready</h2>
+    <p>On iPad, tap <b>Save / Share</b>, then choose <b>Save Image</b> for Photos or <b>Save to Files</b>.</p>
+    <div class="save-dialog-actions">
+      <button class="primary" id="sharePreparedImage" type="button">Save / Share</button>
+      <button id="openPreparedImage" type="button">Open Image</button>
+      <button id="cancelPreparedImage" type="button">Cancel</button>
+    </div>
+  </div>
+</div>
 <script>
 (()=>{
-const worksheet=document.getElementById('worksheet'),mapShell=document.getElementById('mapShell'),mapStage=document.getElementById('mapStage'),mapSvg=document.getElementById('mapSvg'),zoomLabel=document.getElementById('zoomLabel'),status=document.getElementById('status');
+const worksheet=document.getElementById('worksheet'),mapShell=document.getElementById('mapShell'),mapStage=document.getElementById('mapStage'),mapSvg=document.getElementById('mapSvg'),zoomLabel=document.getElementById('zoomLabel'),status=document.getElementById('status'),saveOverlay=document.getElementById('saveOverlay'),sharePreparedImageBtn=document.getElementById('sharePreparedImage'),openPreparedImageBtn=document.getElementById('openPreparedImage'),cancelPreparedImageBtn=document.getElementById('cancelPreparedImage');
 const colors=[document.getElementById('c1'),document.getElementById('c2'),document.getElementById('c3')],swatches=[document.getElementById('sw1'),document.getElementById('sw2'),document.getElementById('sw3')];
 const countryStates=new Map(),state={scale:1,x:0,y:0},pointers=new Map();const SCALE_MIN=1,SCALE_MAX=4,ZOOM_STEP=1.2;let dragState=null,pinchState=null,pressCountry=null,pressPointerId=null,pressStartX=0,pressStartY=0,dragMoved=false,lastPaintCountry=null,lastPaintAt=0,recentDragUntil=0;
 function buildAnswers(id,start,end){const c=document.getElementById(id);for(let i=start;i<=end;i++){const row=document.createElement('label');row.className='answer-row';row.innerHTML=`<span>${i}.</span><input type="text" autocomplete="off" aria-label="${i}번 국가 이름 입력">`;c.appendChild(row)}}buildAnswers('answers1',1,9);buildAnswers('answers2',10,18);buildAnswers('answers3',19,22);
@@ -262,90 +281,76 @@ function canvasToPngBlob(canvas){
     canvas.toBlob(blob=>blob?resolve(blob):reject(new Error('PNG conversion failed.')),'image/png',1);
   });
 }
-
 function isAppleTouchDevice(){
-  return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
-    (navigator.platform==='MacIntel' && navigator.maxTouchPoints>1);
+  return /iPad|iPhone|iPod/.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
 }
+let preparedPngBlob=null,preparedPngFile=null,preparedObjectUrl=null;
 
+function clearPreparedImage(){
+  if(preparedObjectUrl){URL.revokeObjectURL(preparedObjectUrl);preparedObjectUrl=null}
+  preparedPngBlob=null;preparedPngFile=null;
+}
+function showSaveOverlay(){
+  saveOverlay.classList.add('show');saveOverlay.setAttribute('aria-hidden','false');
+  requestAnimationFrame(()=>sharePreparedImageBtn.focus());
+}
+function hideSaveOverlay(){
+  saveOverlay.classList.remove('show');saveOverlay.setAttribute('aria-hidden','true');
+}
+async function prepareWorksheetPng(){
+  const svg=worksheetSvgString(),svgBlob=new Blob([svg],{type:'image/svg+xml;charset=utf-8'}),svgUrl=URL.createObjectURL(svgBlob),image=new Image();
+  try{
+    await new Promise((resolve,reject)=>{image.onload=resolve;image.onerror=()=>reject(new Error('Worksheet image could not be rendered.'));image.src=svgUrl});
+  }finally{URL.revokeObjectURL(svgUrl)}
+  const W=1100,H=1500,scale=2,canvas=document.createElement('canvas');
+  canvas.width=W*scale;canvas.height=H*scale;
+  const ctx=canvas.getContext('2d');ctx.scale(scale,scale);ctx.fillStyle='#fff';ctx.fillRect(0,0,W,H);ctx.drawImage(image,0,0,W,H);
+  const pngBlob=await canvasToPngBlob(canvas),filename='wwi_1914_worksheet.png',pngFile=new File([pngBlob],filename,{type:'image/png',lastModified:Date.now()});
+  return {pngBlob,pngFile,filename};
+}
 async function saveAsImage(){
   status.textContent='Preparing image export...';
-  const prev={...state};
-  resetView();
-  await new Promise(r=>requestAnimationFrame(r));
-
+  const prev={...state};resetView();await new Promise(r=>requestAnimationFrame(r));
   try{
-    const svg=worksheetSvgString();
-    const svgBlob=new Blob([svg],{type:'image/svg+xml;charset=utf-8'});
-    const svgUrl=URL.createObjectURL(svgBlob);
-    const image=new Image();
-
-    try{
-      await new Promise((resolve,reject)=>{
-        image.onload=resolve;
-        image.onerror=()=>reject(new Error('Worksheet image could not be rendered.'));
-        image.src=svgUrl;
-      });
-    } finally {
-      URL.revokeObjectURL(svgUrl);
+    clearPreparedImage();
+    const prepared=await prepareWorksheetPng();
+    if(isAppleTouchDevice()){
+      preparedPngBlob=prepared.pngBlob;preparedPngFile=prepared.pngFile;
+      status.textContent='Image ready. Tap Save / Share.';
+      showSaveOverlay();
+      return;
     }
-
-    const W=1100,H=1500,scale=2;
-    const canvas=document.createElement('canvas');
-    canvas.width=W*scale;
-    canvas.height=H*scale;
-    const ctx=canvas.getContext('2d');
-    ctx.scale(scale,scale);
-    ctx.fillStyle='#fff';
-    ctx.fillRect(0,0,W,H);
-    ctx.drawImage(image,0,0,W,H);
-
-    const pngBlob=await canvasToPngBlob(canvas);
-    const filename='wwi_1914_worksheet.png';
-    const pngFile=new File([pngBlob],filename,{type:'image/png',lastModified:Date.now()});
-
-    // iPad/iPhone Safari: use the native share sheet. From there the user can
-    // choose “Save Image” for Photos or “Save to Files”. This avoids Safari's
-    // unreliable programmatic-download behavior on iPadOS.
-    if(navigator.share && navigator.canShare && navigator.canShare({files:[pngFile]})){
-      try{
-        status.textContent=isAppleTouchDevice()
-          ? 'Choose “Save Image” or “Save to Files” in the share sheet.'
-          : 'Choose where to save or share the image.';
-        await navigator.share({
-          files:[pngFile],
-          title:'WWI 1914 Worksheet'
-        });
-        status.textContent='Image ready.';
-        return;
-      }catch(err){
-        if(err && err.name==='AbortError'){
-          status.textContent='Save canceled.';
-          return;
-        }
-        console.warn('Native share failed; falling back to download.',err);
-      }
-    }
-
-    // PC / Android / browsers without file sharing: normal PNG download.
-    const url=URL.createObjectURL(pngBlob);
-    const a=document.createElement('a');
-    a.href=url;
-    a.download=filename;
-    a.style.display='none';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(()=>URL.revokeObjectURL(url),1500);
-    status.textContent='Saved as image.';
-  }catch(err){
-    console.error(err);
-    status.textContent='Image export failed in this browser.';
-  }finally{
-    Object.assign(state,prev);
-    applyTransform();
-  }
+    const url=URL.createObjectURL(prepared.pngBlob),a=document.createElement('a');
+    a.href=url;a.download=prepared.filename;a.style.display='none';document.body.appendChild(a);a.click();a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),1500);status.textContent='Saved as image.';
+  }catch(err){console.error(err);status.textContent='Image export failed in this browser.'}
+  finally{Object.assign(state,prev);applyTransform()}
 }
+
+sharePreparedImageBtn.addEventListener('click',()=>{
+  if(!preparedPngFile){status.textContent='Please prepare the image again.';hideSaveOverlay();return}
+  if(navigator.share&&(!navigator.canShare||navigator.canShare({files:[preparedPngFile]}))){
+    status.textContent='Choose Save Image or Save to Files.';
+    navigator.share({files:[preparedPngFile],title:'WWI 1914 Worksheet'})
+      .then(()=>{status.textContent='Image ready.';hideSaveOverlay()})
+      .catch(err=>{
+        if(err&&err.name==='AbortError')status.textContent='Save canceled.';
+        else{console.warn('Native share failed:',err);status.textContent='Share failed. Tap Open Image and save it manually.'}
+      });
+    return;
+  }
+  status.textContent='Sharing is unavailable. Tap Open Image.';
+});
+openPreparedImageBtn.addEventListener('click',()=>{
+  if(!preparedPngBlob){status.textContent='Please prepare the image again.';hideSaveOverlay();return}
+  if(preparedObjectUrl)URL.revokeObjectURL(preparedObjectUrl);
+  preparedObjectUrl=URL.createObjectURL(preparedPngBlob);
+  const opened=window.open(preparedObjectUrl,'_blank');
+  if(opened){status.textContent='Image opened. Long-press it to save to Photos.';hideSaveOverlay()}
+  else status.textContent='Pop-up blocked. Allow pop-ups or use Save / Share.';
+});
+cancelPreparedImageBtn.addEventListener('click',()=>{hideSaveOverlay();status.textContent='Save canceled.'});
+saveOverlay.addEventListener('click',e=>{if(e.target===saveOverlay){hideSaveOverlay();status.textContent='Save canceled.'}});
 document.getElementById('saveImage').addEventListener('click',saveAsImage);
 })();
 </script>
